@@ -62,9 +62,9 @@ from vllm.triton_utils import tl, triton
 from vllm.utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-from .interfaces import (HasInnerState, IsHybrid, MixtureOfExperts,
+from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid, MixtureOfExperts,
                          SupportsLoRA, SupportsPP)
-from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
+from vllm.model_executor.models.utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
@@ -1055,6 +1055,8 @@ class Qwen3NextModel(nn.Module):
 
 class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
                            MixtureOfExperts, IsHybrid):
+
+    
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1066,6 +1068,9 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        GREEN = "\033[32m"
+        RESET = "\033[0m"
+        print(f"{GREEN}\n[vLLM Plugin] Qwen3NextForCausalLM init\n{RESET}")
         config = vllm_config.model_config.hf_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config

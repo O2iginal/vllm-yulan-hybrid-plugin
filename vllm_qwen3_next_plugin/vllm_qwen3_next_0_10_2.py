@@ -27,7 +27,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.model_executor.layers.layernorm import (
-    GemmaRMSNorm as Qwen3NextRMSNorm)
+    RMSNorm as Qwen3NextRMSNorm) # @gyzp change from GemmaRMSNorm to RMSNorm
 # yapf: enable
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
@@ -652,14 +652,14 @@ class Qwen3NextAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None)
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self.attn_output_gate = getattr(config, "attn_output_gate", False) # @gyzp disable attn output gate
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
-            bias=getattr(config, "qkv_bias", False),
+            bias=getattr(config, "qkv_bias", True), # @gyzp enable qkv bias
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
@@ -697,8 +697,9 @@ class Qwen3NextAttention(nn.Module):
             } if self.dual_chunk_attention_config else {},
         )
 
-        self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # @gyzp disable qk norm
+        # self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -720,10 +721,13 @@ class Qwen3NextAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
 
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-            -1, self.num_heads * self.head_dim)
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-            -1, self.num_kv_heads * self.head_dim)
+        # @gyzp disable qk norm
+        # q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+        #     -1, self.num_heads * self.head_dim)
+        # k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+        #     -1, self.num_kv_heads * self.head_dim)
+        q = q.view(-1, self.num_heads, self.head_dim).view(-1, self.num_heads * self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim).view(-1, self.num_kv_heads * self.head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
 
@@ -1108,7 +1112,7 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         self.expert_weights = []
         self.moe_layers: list[FusedMoE] = []
 
-        # 检查是否有 MoE 层
+        # 检查是否有 MoE 层, @gyzp 可禁用 MoE
         if config.num_experts == 0:
             # 当 num_experts 为 0 时，设置默认值
             self.num_moe_layers = 0

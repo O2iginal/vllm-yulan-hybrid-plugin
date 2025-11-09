@@ -1059,8 +1059,6 @@ class Qwen3NextModel(nn.Module):
 
 class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
                            MixtureOfExperts, IsHybrid):
-
-    
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",

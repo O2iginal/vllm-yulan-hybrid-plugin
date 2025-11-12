@@ -27,7 +27,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoE
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.model_executor.layers.layernorm import (
-    GemmaRMSNorm as Qwen3NextRMSNorm)
+    RMSNorm as Qwen3NextRMSNorm) # @gyzp change from GemmaRMSNorm to RMSNorm
 # yapf: enable
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
@@ -57,9 +57,9 @@ from vllm.triton_utils import tl, triton
 from vllm.utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-from .interfaces import (HasInnerState, IsHybrid, MixtureOfExperts,
+from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid, MixtureOfExperts,
                          SupportsLoRA, SupportsPP)
-from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
+from vllm.model_executor.models.utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
@@ -87,7 +87,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
-        if self.tp_size > config.num_experts:
+        if config.num_experts > 0 and self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.num_experts}.")
@@ -688,8 +688,9 @@ class Qwen3NextAttention(nn.Module):
             } if self.dual_chunk_attention_config else {},
         )
 
-        self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # @gyzp disable qk norm
+        # self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -711,10 +712,13 @@ class Qwen3NextAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
 
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-            -1, self.num_heads * self.head_dim)
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-            -1, self.num_kv_heads * self.head_dim)
+        # @gyzp disable qk norm
+        # q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+        #     -1, self.num_heads * self.head_dim)
+        # k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+        #     -1, self.num_kv_heads * self.head_dim)
+        q = q.view(-1, self.num_heads, self.head_dim).view(-1, self.num_heads * self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim).view(-1, self.num_kv_heads * self.head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
 
@@ -940,6 +944,10 @@ class Qwen3NextModel(nn.Module):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # 如果没有专家，返回空列表
+        if self.config.num_experts == 0:
+            return []
+            
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return FusedMoE.make_expert_params_mapping(
@@ -1038,6 +1046,9 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        GREEN = "\033[32m"
+        RESET = "\033[0m"
+        print(f"{GREEN}\n[vLLM Plugin] Qwen3NextForCausalLM init\n{RESET}")
         config = vllm_config.model_config.hf_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -1074,27 +1085,41 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         self.expert_weights = []
 
         self.moe_layers: list[FusedMoE] = []
-        example_layer = None
-        for layer in self.model.layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
 
-            assert isinstance(layer, Qwen3NextDecoderLayer)
-            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
-                example_layer = layer.mlp
-                self.moe_layers.append(layer.mlp.experts)
+        # 检查是否有 MoE 层, @gyzp 可禁用 MoE
+        if config.num_experts == 0:
+            # 当 num_experts 为 0 时，设置默认值
+            self.num_moe_layers = 0
+            self.num_expert_groups = 1
+            self.num_shared_experts = 0
+            self.num_logical_experts = 0
+            self.num_physical_experts = 0
+            self.num_local_physical_experts = 0
+            self.num_routed_experts = 0
+            self.num_redundant_experts = 0
+        else:
+            # 原有的 example_layer 查找逻辑
+            example_layer = None
+            for layer in self.model.layers:
+                if isinstance(layer, PPMissingLayer):
+                    continue
 
-        if example_layer is None:
-            raise RuntimeError("No Qwen3Next layer found in the model.layers.")
+                assert isinstance(layer, Qwen3NextDecoderLayer)
+                if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
+                    example_layer = layer.mlp
+                    self.moe_layers.append(layer.mlp.experts)
 
-        self.num_moe_layers = len(self.moe_layers)
-        self.num_expert_groups = 1
-        self.num_shared_experts = 0
-        self.num_logical_experts = example_layer.n_logical_experts
-        self.num_physical_experts = example_layer.n_physical_experts
-        self.num_local_physical_experts = example_layer.n_local_physical_experts
-        self.num_routed_experts = example_layer.n_routed_experts
-        self.num_redundant_experts = example_layer.n_redundant_experts
+            if example_layer is None:
+                raise RuntimeError("No Qwen3Next layer found in the model.layers.")
+
+            self.num_moe_layers = len(self.moe_layers)
+            self.num_expert_groups = 1
+            self.num_shared_experts = 0
+            self.num_logical_experts = example_layer.n_logical_experts
+            self.num_physical_experts = example_layer.n_physical_experts
+            self.num_local_physical_experts = example_layer.n_local_physical_experts
+            self.num_routed_experts = example_layer.n_routed_experts
+            self.num_redundant_experts = example_layer.n_redundant_experts
 
     def set_eplb_state(
         self,
@@ -1102,6 +1127,10 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> None:
+        # 如果没有 MoE 层，直接返回
+        if self.config.num_experts == 0:
+            return
+            
         for layer_idx, layer in enumerate(self.moe_layers):
             # Register the expert weights.
             self.expert_weights.append(layer.get_expert_weights())
@@ -1117,6 +1146,10 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         num_physical_experts: int,
         num_local_physical_experts: int,
     ) -> None:
+        # 如果没有 MoE 层，直接返回
+        if self.config.num_experts == 0:
+            return
+            
         assert self.num_local_physical_experts == num_local_physical_experts
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts

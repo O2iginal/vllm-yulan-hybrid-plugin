@@ -25,7 +25,7 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               make_empty_intermediate_tensors_factory,
                                               maybe_prefix)
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs import Qwen3NextConfig
+from ..configuration_yulan_hybrid import YuLanHybridConfig
 
 from .v0_11_0 import YuLanHybridDecoderLayer
 
@@ -43,7 +43,7 @@ class YuLanHybridMultiTokenPredictor(nn.Module):
         model_config = vllm_config.model_config
         quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
-        config: Qwen3NextConfig = model_config.hf_config
+        config: YuLanHybridConfig = model_config.hf_config
 
         self.config = config
         lora_vocab = ((lora_config.lora_extra_vocab_size *

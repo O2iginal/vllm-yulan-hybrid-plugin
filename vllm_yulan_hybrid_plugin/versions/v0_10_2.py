@@ -97,7 +97,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.configs import Qwen3NextConfig
+from ..configuration_yulan_hybrid import YuLanHybridConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -111,7 +111,7 @@ class YuLanHybridSparseMoeBlock(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3NextConfig,
+        config: YuLanHybridConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         enable_eplb: bool = False,
@@ -240,7 +240,7 @@ class YuLanHybridGatedDeltaNet(nn.Module, MambaBase):
 
     def __init__(
         self,
-        config: Qwen3NextConfig,
+        config: YuLanHybridConfig,
         model_config: Optional[ModelConfig] = None,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -661,7 +661,7 @@ class YuLanHybridAttention(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3NextConfig,
+        config: YuLanHybridConfig,
         model_config: Optional[ModelConfig] = None,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -782,7 +782,7 @@ class YuLanHybridDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3NextConfig,
+        config: YuLanHybridConfig,
         layer_type: str,
         model_config: Optional[ModelConfig] = None,
         cache_config: Optional[CacheConfig] = None,
@@ -920,7 +920,7 @@ class YuLanHybridModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
-        config: Qwen3NextConfig = vllm_config.model_config.hf_config
+        config: YuLanHybridConfig = vllm_config.model_config.hf_config
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config

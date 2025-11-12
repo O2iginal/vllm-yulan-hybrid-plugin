@@ -3,7 +3,14 @@ RESET = "\033[0m"
 
 def register():
     from vllm import ModelRegistry
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
     import vllm
+    
+    # Register configuration class
+    from .configuration_yulan_hybrid import YuLanHybridConfig
+    if "yulan_hybrid" not in _CONFIG_REGISTRY:
+        _CONFIG_REGISTRY["yulan_hybrid"] = YuLanHybridConfig
+        print(f"{GREEN}[vLLM Plugin] Registered YuLanHybridConfig{RESET}")
     
     # Get vLLM version and select appropriate implementation
     vllm_version = vllm.__version__

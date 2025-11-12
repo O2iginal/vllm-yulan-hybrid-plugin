@@ -1406,4 +1406,735 @@ class Gemma3TextModelConfig:
 huggingface往往有一个ModelNameConfiguration class来规范config.json的字段名列表，
 那么vllm中，是否会限制约束config.json中的内容？
 或者说，vllm对于config.json的解析是否依赖于transformers huggingface定义的config class？
-*Codemap generation in progress or failed to parse*
+## vLLM config.json解析和配置依赖关系流程
+此codemap展示了vLLM解析config.json的完整流程，包括格式检测[1a-1d]、配置类选择[2a-2d]、后处理覆盖[3a-3e]和自定义配置实现[4a-4c]。核心逻辑位于vllm/transformers_utils/config.py的get_config函数中。
+### 1. 配置格式检测和解析器选择
+vLLM如何自动检测配置文件格式并选择合适的解析器
+### 1a. 自动格式检测入口 (`config.py:575`)
+当config_format为auto时启动格式检测逻辑
+```text
+if config_format == "auto":
+```
+### 1b. 检测HF格式config.json (`config.py:577`)
+优先检测是否存在HuggingFace标准格式的config.json
+```text
+if is_gguf or file_or_path_exists(model, HF_CONFIG_NAME, revision=revision):
+```
+### 1c. 检测Mistral格式params.json (`config.py:579`)
+如果不是HF格式，检测Mistral特有的params.json格式
+```text
+elif file_or_path_exists(model, MISTRAL_CONFIG_NAME, revision=revision):
+```
+### 1d. 获取对应解析器 (`config.py:608`)
+根据检测到的格式选择并实例化配置解析器
+```text
+config_parser = get_config_parser(config_format)
+```
+### 2. HF配置解析和类选择逻辑
+HuggingFace配置解析器如何根据model_type选择配置类
+### 2a. 获取配置字典 (`config.py:123`)
+使用Transformers标准API读取config.json为字典
+```text
+config_dict, _ = PretrainedConfig.get_config_dict(
+```
+### 2b. 提取模型类型 (`config.py:131`)
+从配置字典中获取model_type字段用于类选择
+```text
+model_type = config_dict.get("model_type")
+```
+### 2c. 检查vLLM自定义配置 (`config.py:139`)
+优先检查是否在vLLM自定义配置注册表中
+```text
+if model_type in _CONFIG_REGISTRY:
+```
+### 2d. 使用Transformers AutoConfig (`config.py:151`)
+如果不在自定义注册表，使用标准Transformers AutoConfig加载
+```text
+config = AutoConfig.from_pretrained(
+```
+### 3. 配置后处理和覆盖机制
+vLLM如何对加载的配置进行后处理和用户自定义覆盖
+### 3a. 检查architectures字段 (`config.py:624`)
+确保配置包含必需的architectures字段
+```text
+if not config.architectures:
+```
+### 3b. 从model_type推断架构 (`config.py:632`)
+如果缺少architectures，从model_type自动推断
+```text
+model_type = MODEL_MAPPING_NAMES[config.model_type]
+```
+### 3c. 应用用户覆盖 (`config.py:673`)
+应用用户通过hf_overrides参数指定的配置覆盖
+```text
+if hf_overrides_kw:
+```
+### 3d. 更新配置对象 (`config.py:675`)
+直接更新PretrainedConfig对象的属性
+```text
+config.update(hf_overrides_kw)
+```
+### 3e. 应用历史补丁 (`config.py:680`)
+对RoPE配置应用向后兼容性补丁
+```text
+patch_rope_scaling(config)
+```
+### 4. 自定义配置类实现示例
+展示vLLM自定义配置类如何扩展Transformers PretrainedConfig
+### 4a. 继承PretrainedConfig (`deepseek_v3.py:9`)
+vLLM自定义配置类继承Transformers基类
+```text
+class DeepseekV3Config(PretrainedConfig):
+```
+### 4b. 定义模型类型 (`deepseek_v3.py:10`)
+model_type用于在_CONFIG_REGISTRY中匹配
+```text
+model_type = "deepseek_v3"
+```
+### 4c. 调用父类构造 (`deepseek_v3.py:94`)
+调用Transformers PretrainedConfig的初始化方法
+```text
+super().__init__(
+```
+## Q6
+所以当我自定义vllm model时，还需要编写configuration_xxx.py和modeling_xxx.py嘛，还是只需要有config.json?
+## vLLM自定义模型配置文件需求分析
+此codemap分析了vLLM自定义模型时对配置文件的需求，展示了配置加载流程[1a-1d]、自定义配置类实现场景[2a-2d]和模型注册机制[3a-3d]。核心结论是：大多数情况下只需要config.json，只有特殊需求才需要configuration_xxx.py。
+### 1. 配置加载流程：从config.json到配置对象
+vLLM如何通过config.json自动确定配置类，以及在什么情况下需要自定义配置类
+### 1a. 读取config.json为字典 (`config.py:123`)
+使用Transformers标准API读取配置文件
+```text
+config_dict, _ = PretrainedConfig.get_config_dict(
+```
+### 1b. 提取模型类型 (`config.py:131`)
+从配置中获取model_type用于类匹配
+```text
+model_type = config_dict.get("model_type")
+```
+### 1c. 检查vLLM自定义配置 (`config.py:139`)
+优先检查是否需要vLLM特殊配置类
+```text
+if model_type in _CONFIG_REGISTRY:
+```
+### 1d. 使用Transformers标准配置 (`config.py:151`)
+回退到标准AutoConfig加载
+```text
+config = AutoConfig.from_pretrained(
+```
+### 2. 自定义配置类实现场景
+分析什么情况下需要编写configuration_xxx.py文件以及实现方式
+### 2a. 继承Transformers配置基类 (`deepseek_v3.py:9`)
+vLLM自定义配置类必须继承PretrainedConfig
+```text
+class DeepseekV3Config(PretrainedConfig):
+```
+### 2b. 定义唯一模型类型 (`deepseek_v3.py:10`)
+model_type用于在注册表中匹配
+```text
+model_type = "deepseek_v3"
+```
+### 2c. 注册到配置表 (`config.py:79`)
+在_CONFIG_REGISTRY中注册映射关系
+```text
+deepseek_v3="DeepseekV3Config",
+```
+### 2d. 直接使用标准配置 (`llama.py:33`)
+大多数模型直接使用Transformers配置类
+```text
+from transformers import LlamaConfig
+```
+### 3. 模型注册与实现分离
+vLLM中modeling_xxx.py是内部实现文件，用户插件只需要注册模型类
+### 3a. 插件注册模型类 (`__init__.py:12`)
+用户通过插件注册自定义模型实现
+```text
+ModelRegistry.register_model("MyOPTForCausalLM", MyOPTForCausalLM)
+```
+### 3b. 导入用户模型实现 (`registration.md:31`)
+用户提供自己的模型类实现
+```text
+from your_code import YourModelForCausalLM
+```
+### 3c. 用户模型实现 (`basic.md:44`)
+用户需要实现符合vLLM规范的模型类
+```text
+class MyModel(nn.Module):
+```
+### 3d. 统一构造函数签名 (`basic.md:45`)
+必须使用vLLM要求的构造函数格式
+```text
+def __init__(self, vllm_config: VllmConfig, prefix: str):
+```
+## Q7
+所以当我自定义vllm model时，还需要编写configuration_xxx.py和modeling_xxx.py嘛，还是只需要有config.json?
+
+什么时候是特殊情况？
+### Answer
+# vLLM自定义模型的文件需求
+
+根据您的问题,我来明确说明在vLLM中自定义模型时需要哪些文件,以及什么情况下需要额外的配置文件。<cite/>
+
+## 核心答案
+
+**大多数情况下,您只需要提供`config.json`文件即可。** vllm:56-68 
+
+您**不需要**编写`modeling_xxx.py`文件 - 这是vLLM内部的模型实现文件。<cite/>作为用户,您需要做的是:
+
+1. **编写您自己的模型实现类**(可以放在任何Python模块中)
+2. **通过插件系统注册**这个模型类
+3. **提供标准的`config.json`**文件
+
+## 什么时候需要`configuration_xxx.py`?
+
+只有在以下**特殊情况**下才需要编写自定义配置类: vllm:4-8 
+
+### 特殊情况1: HuggingFace未定义配置
+
+当您的模型在HuggingFace Hub或Transformers库中**没有对应的配置类**时。<cite/>
+
+**示例**: DeepSeek V3模型需要自定义配置类,因为Transformers库尚未官方支持: vllm:9-10 
+
+### 特殊情况2: 需要覆盖现有配置
+
+当您需要**修改或扩展**现有配置以支持vLLM特定功能时。<cite/>
+
+**示例**: 某些模型需要在配置中添加vLLM特定的字段,如RoPE配置或量化参数。 vllm:33-50 
+
+## 标准流程(无需configuration_xxx.py)
+
+对于大多数模型,vLLM会自动使用Transformers的`AutoConfig`加载配置: vllm:151-151 
+
+**工作流程**:
+1. vLLM读取您的`config.json` vllm:123-123 
+2. 提取`model_type`字段 vllm:131-131 
+3. 检查是否在vLLM的`_CONFIG_REGISTRY`中 vllm:139-139 
+4. 如果不在,使用Transformers的标准配置类 vllm:151-151 
+
+## 实际示例对比
+
+### 标准模型(只需config.json)
+
+Llama模型直接使用Transformers的`LlamaConfig`: vllm:33-33 
+
+您只需要:
+- 标准的`config.json`(包含`model_type: "llama"`)
+- 您的模型实现类
+- 插件注册代码
+
+### 特殊模型(需要configuration_xxx.py)
+
+DeepSeek V3需要自定义配置类,因为它有特殊的配置需求: vllm:9-10 
+
+这个配置类被注册到vLLM的配置表中: vllm:79-79 
+
+## Notes
+
+关键区别在于:**`modeling_xxx.py`是vLLM内部使用的命名约定**,用于组织其自带的模型实现。<cite/>作为外部用户,您不需要遵循这个命名 - 您可以将模型实现放在任何Python模块中,然后通过插件系统注册即可。 vllm:31-31 
+
+如果您的模型配置与现有Transformers模型兼容(例如基于Llama架构的变体),您完全不需要编写`configuration_xxx.py`。只有当您的模型有独特的配置需求,且Transformers库不支持时,才需要自定义配置类。<cite/>
+
+Wiki pages you might want to explore:
+- [Model Support (vllm-project/vllm)](/wiki/vllm-project/vllm#3)
+### Citations
+**File:** docs/models/supported_models.md (L56-68)
+```markdown
+For a model to be compatible with the Transformers backend for vLLM it must:
+
+- be a Transformers compatible custom model (see [Transformers - Customizing models](https://huggingface.co/docs/transformers/en/custom_models)):
+    - The model directory must have the correct structure (e.g. `config.json` is present).
+    - `config.json` must contain `auto_map.AutoModel`.
+- be a Transformers backend for vLLM compatible model (see [Writing custom models](#writing-custom-models)):
+    - Customisation should be done in the base model (e.g. in `MyModel`, not `MyModelForCausalLM`).
+
+If the compatible model is:
+
+- on the Hugging Face Model Hub, simply set `trust_remote_code=True` for [offline-inference](../serving/offline_inference.md) or `--trust-remote-code` for the [openai-compatible-server](../serving/openai_compatible_server.md).
+- in a local directory, simply pass directory path to `model=<MODEL_DIR>` for [offline-inference](../serving/offline_inference.md) or `vllm serve <MODEL_DIR>` for the [openai-compatible-server](../serving/openai_compatible_server.md).
+
+```
+**File:** vllm/transformers_utils/configs/__init__.py (L4-8)
+```python
+Model configs may be defined in this directory for the following reasons:
+
+- There is no configuration file defined by HF Hub or Transformers library.
+- There is a need to override the existing config to support vLLM.
+"""
+```
+**File:** vllm/model_executor/models/config.py (L33-50)
+```python
+class GteNewModelConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        config = vllm_config.model_config.hf_config
+
+        assert config.__class__.__name__ == "NewConfig"
+        assert config.hidden_act == "gelu"
+
+        config.hidden_act = "geglu"
+
+        head_dim = config.hidden_size // config.num_attention_heads
+        config.rotary_kwargs = {
+            "head_size": head_dim,
+            "rotary_dim": getattr(config, "rotary_emb_dim", head_dim),
+            "max_position": config.max_position_embeddings,
+            "base": config.rope_theta,
+            "rope_scaling": getattr(config, "rope_scaling", None),
+        }
+```
+## Q8
+也就是说，architectures字段用来识别modeling，而model type字段用于确定configuration对吗
+### Answer
+是的,您的理解基本正确!让我详细解释这两个字段在vLLM中的作用:<cite/>
+
+## `architectures` 字段 - 识别模型实现类
+
+`architectures`字段用于确定使用哪个**模型实现类**(modeling)。 vllm:20-20 
+
+当vLLM加载模型时,会从`config.json`中读取`architectures`字段,然后在`ModelRegistry`中查找对应的模型类: vllm:167-172 
+
+例如,如果`config.json`中有:
+```json
+{
+  "architectures": ["LlamaForCausalLM"]
+}
+```
+
+vLLM会在模型注册表中查找`"LlamaForCausalLM"`对应的实现类: vllm:124-124 
+
+## `model_type` 字段 - 确定配置类
+
+`model_type`字段用于确定使用哪个**配置类**(configuration)。 vllm:13-13 
+
+配置加载流程: vllm:131-131 
+
+1. 首先检查`model_type`是否在vLLM的`_CONFIG_REGISTRY`中 vllm:139-141 
+2. 如果在,使用vLLM自定义的配置类
+3. 如果不在,使用Transformers的`AutoConfig.from_pretrained()` vllm:151-151 
+
+## 两者的关系
+
+这两个字段在加载流程中的作用时机不同:
+
+1. **先加载配置**: `model_type` → 确定配置类 → 创建配置对象
+2. **再加载模型**: `architectures` → 确定模型类 → 创建模型实例
+
+如果`config.json`缺少`architectures`字段,vLLM会尝试从`model_type`自动推断: vllm:624-633 
+
+## Notes
+
+需要注意的是,`architectures`字段通常是一个列表,vLLM会按顺序尝试匹配,直到找到支持的架构。 vllm:919-923 而`model_type`是一个字符串,用于唯一标识配置类型。 vllm:10-10 
+
+Wiki pages you might want to explore:
+- [Model Support (vllm-project/vllm)](/wiki/vllm-project/vllm#3)
+### Citations
+**File:** docs/design/huggingface_integration.md (L13-13)
+```markdown
+
+```
+**File:** docs/design/huggingface_integration.md (L20-20)
+```markdown
+5. Finally, vLLM can reach the model class we want to initialize. vLLM uses the `architectures` field in the config object to determine the model class to initialize, as it maintains the mapping from architecture name to model class in [its registry](https://github.com/vllm-project/vllm/blob/127c07480ecea15e4c2990820c457807ff78a057/vllm/model_executor/models/registry.py#L80). If the architecture name is not found in the registry, it means this model architecture is not supported by vLLM. For `Qwen/Qwen2-7B`, the `architectures` field is `["Qwen2ForCausalLM"]`, which corresponds to the `Qwen2ForCausalLM` class in [vLLM's code](https://github.com/vllm-project/vllm/blob/127c07480ecea15e4c2990820c457807ff78a057/vllm/model_executor/models/qwen2.py#L364). This class will initialize itself depend ... (truncated)
+```
+**File:** vllm/model_executor/model_loader/utils.py (L167-172)
+```python
+    architectures = getattr(model_config.hf_config, "architectures", [])
+
+    model_cls, arch = model_config.registry.resolve_model_cls(
+        architectures,
+        model_config=model_config,
+    )
+```
+**File:** vllm/model_executor/models/registry.py (L124-124)
+```python
+    "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
+```
+**File:** vllm/model_executor/models/registry.py (L919-923)
+```python
+        for arch in architectures:
+            normalized_arch = self._normalize_arch(arch, model_config)
+            model_info = self._try_inspect_model_cls(normalized_arch)
+            if model_info is not None:
+                return (model_info, arch)
+```
+**File:** vllm/transformers_utils/config.py (L131-131)
+```python
+        model_type = config_dict.get("model_type")
+```
+**File:** vllm/transformers_utils/config.py (L139-141)
+```python
+        if model_type in _CONFIG_REGISTRY:
+            config_class = _CONFIG_REGISTRY[model_type]
+            config = config_class.from_pretrained(
+```
+**File:** vllm/transformers_utils/config.py (L151-151)
+```python
+                config = AutoConfig.from_pretrained(
+```
+**File:** vllm/transformers_utils/config.py (L624-633)
+```python
+    if not config.architectures:
+        if config.model_type not in MODEL_MAPPING_NAMES:
+            logger.warning(
+                "Model config does not have a top-level 'architectures' field: "
+                "expecting `hf_overrides={'architectures': ['...']}` to be passed "
+                "in engine args."
+            )
+        else:
+            model_type = MODEL_MAPPING_NAMES[config.model_type]
+            config.update({"architectures": [model_type]})
+```
+## Q9
+如果我的自定义模型需要自定义configuration呢？最好的组织形式是什么？是也进行注册嘛？还是放到ceckpoint文件夹
+### Answer
+# vLLM自定义模型配置的最佳组织方式
+
+根据您的问题,您想了解当需要自定义configuration时,应该如何组织代码。<cite/>让我详细说明最佳实践。<cite/>
+
+## 推荐方案:通过注册机制
+
+**最佳实践是将自定义配置类注册到vLLM的配置注册表中**,而不是放到checkpoint文件夹。<cite/>
+
+### 具体实现步骤
+
+#### 1. 创建自定义配置类
+
+在您的插件包中创建配置文件,例如`my_model_config.py`:
+
+```python
+from transformers import PretrainedConfig
+
+class MyModelConfig(PretrainedConfig):
+    model_type = "my_model"  # 必须定义唯一的model_type
+    
+    def __init__(
+        self,
+        vocab_size=32000,
+        hidden_size=4096,
+        # ... 其他配置参数
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+```
+
+**关键要求**:
+- 必须继承`PretrainedConfig`[link to Repo vllm-project/vllm: vllm/transformers_utils/configs/deepseek_v3.py:9-9]
+- 必须定义唯一的`model_type`[link to Repo vllm-project/vllm: vllm/transformers_utils/configs/deepseek_v3.py:10-10]
+- 调用父类构造函数[link to Repo vllm-project/vllm: vllm/transformers_utils/configs/deepseek_v3.py:94-94]
+
+#### 2. 在插件中注册配置类
+
+在您的插件注册函数中,同时注册配置类和模型类:
+
+```python
+# my_vllm_plugin/__init__.py
+def register():
+    from vllm import ModelRegistry
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+    from .my_model_config import MyModelConfig
+    from .my_model import MyModelForCausalLM
+    
+    # 注册配置类
+    if "my_model" not in _CONFIG_REGISTRY:
+        _CONFIG_REGISTRY["my_model"] = MyModelConfig
+    
+    # 注册模型类
+    if "MyModelForCausalLM" not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model("MyModelForCausalLM", MyModelForCausalLM)
+```
+
+vLLM的配置注册表`_CONFIG_REGISTRY`是一个字典,将`model_type`映射到配置类[link to Repo vllm-project/vllm: vllm/transformers_utils/config.py:76-101]。<cite/>
+
+#### 3. 准备config.json
+
+在您的模型checkpoint文件夹中,创建标准的`config.json`:
+
+```json
+{
+  "model_type": "my_model",
+  "architectures": ["MyModelForCausalLM"],
+  "vocab_size": 32000,
+  "hidden_size": 4096
+}
+```
+
+## 为什么不推荐放到checkpoint文件夹
+
+虽然HuggingFace支持在checkpoint文件夹中放置`configuration_xxx.py`文件(通过`auto_map`机制),但这种方式有几个缺点:
+
+1. **需要trust_remote_code**: 用户必须启用`trust_remote_code=True`,存在安全风险[link to Repo vllm-project/vllm: docs/models/supported_models.md:66-66]
+
+2. **不够灵活**: 配置代码与checkpoint绑定,难以版本管理和更新
+
+3. **与vLLM插件系统不一致**: vLLM推荐通过插件系统扩展功能[link to Repo vllm-project/vllm: docs/design/plugin_system.md:3-3]
+
+## 配置加载流程验证
+
+当您按照上述方式组织后,vLLM的加载流程如下:
+
+1. 读取`config.json`,提取`model_type="my_model"`[link to Repo vllm-project/vllm: vllm/transformers_utils/config.py:131-131]
+2. 在`_CONFIG_REGISTRY`中查找`"my_model"`[link to Repo vllm-project/vllm: vllm/transformers_utils/config.py:139-139]
+3. 找到您注册的`MyModelConfig`类并实例化[link to Repo vllm-project/vllm: vllm/transformers_utils/config.py:141-147]
+4. 使用`architectures`字段查找模型实现类[link to Repo vllm-project/vllm: docs/design/huggingface_integration.md:19-19]
+
+## 完整目录结构示例
+
+```
+my_vllm_plugin/
+├── setup.py                    # 插件入口点配置
+├── my_vllm_plugin/
+│   ├── __init__.py            # 注册函数
+│   ├── my_model_config.py     # 自定义配置类
+│   └── my_model.py            # 模型实现
+└── checkpoints/
+    └── my_model/
+        ├── config.json        # 标准配置文件
+        └── model.safetensors  # 模型权重
+```
+
+## Notes
+
+这种注册机制与vLLM内部处理自定义配置的方式完全一致[link to Repo vllm-project/vllm: vllm/transformers_utils/configs/__init__.py:3-7]。<cite/>vLLM自己的自定义配置(如DeepSeek V3)也是通过`_CONFIG_REGISTRY`注册的[link to Repo vllm-project/vllm: vllm/transformers_utils/config.py:79-79]。<cite/>这种方式既保持了与HuggingFace生态的兼容性,又提供了vLLM特有的扩展能力。<cite/>
+
+Wiki pages you might want to explore:
+- [Model Support (vllm-project/vllm)](/wiki/vllm-project/vllm#3)
+
+Wiki pages you might want to explore:
+- [Model Support (vllm-project/vllm)](/wiki/vllm-project/vllm#3)
+## Q10
+这个自定义配置类需要满足什么约束？和huggingface transformers中的configutation有什么关系？如果我想要找一个基础class修改应如何入手？
+### Answer
+# vLLM自定义配置类的约束和基础类选择
+
+您询问的是自定义配置类需要满足什么约束,以及它与HuggingFace Transformers配置类的关系。<cite/>让我详细说明。<cite/>
+
+## 核心约束要求
+
+### 1. 必须继承PretrainedConfig
+
+所有vLLM自定义配置类**必须继承**`transformers.PretrainedConfig`基类: vllm:9-9 
+
+这是因为vLLM的配置加载系统期望所有配置对象都是`PretrainedConfig`的实例,以便使用其标准方法如`from_pretrained()`和`to_dict()`。<cite/>
+
+### 2. 定义唯一的model_type
+
+每个配置类必须定义一个唯一的`model_type`类属性: vllm:10-10 
+
+这个`model_type`用于在`_CONFIG_REGISTRY`中建立映射关系,vLLM通过它来查找对应的配置类。 vllm:131-131 
+
+### 3. 调用父类构造函数
+
+构造函数必须调用`super().__init__(**kwargs)`以继承基类的标准行为: vllm:94-94 
+
+这确保了配置对象能够正确处理通用参数如`vocab_size`、`hidden_size`等。<cite/>
+
+## 与HuggingFace Transformers的关系
+
+### 完全兼容的继承关系
+
+vLLM的自定义配置类**完全遵循**HuggingFace Transformers的配置规范: vllm:27-27 
+
+这意味着:
+1. 可以使用所有`PretrainedConfig`的标准方法
+2. 配置可以通过`from_pretrained()`从HuggingFace Hub加载
+3. 支持`to_dict()`、`to_json_file()`等序列化方法
+
+### 加载优先级
+
+vLLM在加载配置时采用分层策略: vllm:139-158 
+
+1. 首先检查`model_type`是否在vLLM的`_CONFIG_REGISTRY`中
+2. 如果在,使用vLLM自定义配置类
+3. 如果不在,回退到Transformers的`AutoConfig.from_pretrained()`
+
+## 如何选择基础类进行修改
+
+### 方案1: 直接继承PretrainedConfig(推荐)
+
+对于全新的模型架构,直接继承`PretrainedConfig`: vllm:26-27 
+
+```python
+from transformers import PretrainedConfig
+
+class MyModelConfig(PretrainedConfig):
+    model_type = "my_model"
+    
+    def __init__(
+        self,
+        vocab_size=32000,
+        hidden_size=4096,
+        num_hidden_layers=32,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+```
+
+### 方案2: 继承现有模型配置类
+
+如果您的模型是现有架构的变体,可以继承对应的配置类。例如,如果基于Llama架构:
+
+```python
+from transformers import LlamaConfig
+
+class MyLlamaVariantConfig(LlamaConfig):
+    model_type = "my_llama_variant"
+    
+    def __init__(
+        self,
+        custom_param=None,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.custom_param = custom_param
+```
+
+### 方案3: 组合多个配置(多模态模型)
+
+对于多模态模型,可以组合多个子配置: vllm:140-182 
+
+这种方式允许您将视觉编码器和文本模型的配置分开管理。<cite/>
+
+## 实际示例参考
+
+### 简单配置示例
+
+NemotronConfig展示了基本的配置类结构: vllm:26-27 
+
+### 复杂配置示例
+
+OvisConfig展示了如何处理多模态配置: vllm:140-154 
+
+它使用`AutoConfig.for_model()`来动态创建子配置对象。<cite/>
+
+## 配置验证和更新
+
+某些模型需要在初始化时验证和更新配置。vLLM提供了`VerifyAndUpdateConfig`协议: vllm:33-41 
+
+这允许您在模型加载时动态修改配置,例如添加RoPE参数或调整注意力配置。<cite/>
+
+## Notes
+
+vLLM的自定义配置类设计目标是**最大化与HuggingFace生态的兼容性**,同时提供扩展vLLM特定功能的能力。 vllm:4-7 所有自定义配置都必须能够被`PretrainedConfig.get_config_dict()`正确解析 vllm:123-129 ,这确保了配置可以从本地文件或HuggingFace Hub无缝加载。<cite/>
+
+Wiki pages you might want to explore:
+- [Model Support (vllm-project/vllm)](/wiki/vllm-project/vllm#3)
+
+Wiki pages you might want to explore:
+- [Model Support (vllm-project/vllm)](/wiki/vllm-project/vllm#3)
+### Citations
+**File:** vllm/transformers_utils/config.py (L27-27)
+```python
+from transformers import GenerationConfig, PretrainedConfig
+```
+**File:** vllm/transformers_utils/config.py (L123-129)
+```python
+        config_dict, _ = PretrainedConfig.get_config_dict(
+            model,
+            revision=revision,
+            code_revision=code_revision,
+            token=_get_hf_token(),
+            **kwargs,
+        )
+```
+**File:** vllm/transformers_utils/config.py (L131-131)
+```python
+        model_type = config_dict.get("model_type")
+```
+**File:** vllm/transformers_utils/config.py (L139-158)
+```python
+        if model_type in _CONFIG_REGISTRY:
+            config_class = _CONFIG_REGISTRY[model_type]
+            config = config_class.from_pretrained(
+                model,
+                revision=revision,
+                code_revision=code_revision,
+                token=_get_hf_token(),
+                **kwargs,
+            )
+        else:
+            try:
+                kwargs = _maybe_update_auto_config_kwargs(kwargs, model_type=model_type)
+                config = AutoConfig.from_pretrained(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    code_revision=code_revision,
+                    token=_get_hf_token(),
+                    **kwargs,
+                )
+```
+**File:** vllm/transformers_utils/configs/nemotron.py (L26-27)
+```python
+class NemotronConfig(PretrainedConfig):
+    r"""
+```
+**File:** vllm/transformers_utils/configs/ovis.py (L140-182)
+```python
+class OvisConfig(PretrainedConfig):
+    model_type = "ovis"
+
+    def __init__(
+        self,
+        llm_config: PretrainedConfig | dict | None = None,
+        visual_tokenizer_config: PretrainedConfig | dict | None = None,
+        multimodal_max_length=8192,
+        hidden_size=None,
+        conversation_formatter_class=None,
+        llm_attn_implementation=None,
+        disable_tie_weight=False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if llm_config is not None:
+            assert isinstance(llm_config, (PretrainedConfig, dict)), (
+                f"expect `llm_config` to be instance of PretrainedConfig or dict, but got {type(llm_config)} type"
+            )
+            if not isinstance(llm_config, PretrainedConfig):
+                model_type = llm_config["model_type"]
+                llm_config.pop("model_type")
+                llm_config = AutoConfig.for_model(model_type, **llm_config)
+
+        # map llm_config to text_config
+        self.text_config = llm_config
+        if visual_tokenizer_config is not None:
+            assert isinstance(visual_tokenizer_config, (PretrainedConfig, dict)), (
+                f"expect `visual_tokenizer_config` to be instance of PretrainedConfig or dict, but got {type(visual_tokenizer_config)} type"
+            )
+            if not isinstance(visual_tokenizer_config, PretrainedConfig):
+                model_type = visual_tokenizer_config["model_type"]
+                visual_tokenizer_config.pop("model_type")
+                visual_tokenizer_config = AutoConfig.for_model(
+                    model_type, **visual_tokenizer_config
+                )
+
+        self.visual_tokenizer_config = visual_tokenizer_config
+        self.multimodal_max_length = multimodal_max_length
+        self.hidden_size = hidden_size
+        self.conversation_formatter_class = conversation_formatter_class
+        self.llm_attn_implementation = llm_attn_implementation
+        self.disable_tie_weight = disable_tie_weight
+```
+**File:** vllm/model_executor/models/config.py (L33-41)
+```python
+class GteNewModelConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        config = vllm_config.model_config.hf_config
+
+        assert config.__class__.__name__ == "NewConfig"
+        assert config.hidden_act == "gelu"
+
+        config.hidden_act = "geglu"
+```
+**File:** vllm/transformers_utils/configs/__init__.py (L4-7)
+```python
+Model configs may be defined in this directory for the following reasons:
+
+- There is no configuration file defined by HF Hub or Transformers library.
+- There is a need to override the existing config to support vLLM.
+```

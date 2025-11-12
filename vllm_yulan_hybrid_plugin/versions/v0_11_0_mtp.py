@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inference-only Qwen3Next MTP model."""
+"""Inference-only YuLanHybrid MTP model."""
 from collections.abc import Iterable
 from typing import Optional
 
@@ -19,7 +19,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.layers.layernorm import (
-    GemmaRMSNorm as Qwen3NextRMSNorm)
+    GemmaRMSNorm as YuLanHybridRMSNorm)
 from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               is_pp_missing_parameter,
                                               make_empty_intermediate_tensors_factory,
@@ -27,7 +27,7 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import Qwen3NextConfig
 
-from .vllm_qwen3_next_0_11_0 import Qwen3NextDecoderLayer
+from .v0_11_0 import YuLanHybridDecoderLayer
 
 logger = init_logger(__name__)
 
@@ -35,7 +35,7 @@ KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
 @support_torch_compile
-class Qwen3NextMultiTokenPredictor(nn.Module):
+class YuLanHybridMultiTokenPredictor(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -69,7 +69,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
                                        prefix=f'{prefix}.fc')
 
         self.layers = torch.nn.ModuleList(
-            Qwen3NextDecoderLayer(
+            YuLanHybridDecoderLayer(
                 vllm_config,
                 layer_type="full_attention",
                 prefix=f'{prefix}.layers.{idx}',
@@ -79,11 +79,11 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
 
-        self.norm = Qwen3NextRMSNorm(config.hidden_size,
+        self.norm = YuLanHybridRMSNorm(config.hidden_size,
                                      eps=config.rms_norm_eps)
-        self.pre_fc_norm_hidden = Qwen3NextRMSNorm(config.hidden_size,
+        self.pre_fc_norm_hidden = YuLanHybridRMSNorm(config.hidden_size,
                                                    eps=config.rms_norm_eps)
-        self.pre_fc_norm_embedding = Qwen3NextRMSNorm(config.hidden_size,
+        self.pre_fc_norm_embedding = YuLanHybridRMSNorm(config.hidden_size,
                                                       eps=config.rms_norm_eps)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -210,7 +210,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class Qwen3NextMTP(nn.Module, SupportsPP):
+class YuLanHybridMTP(nn.Module, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -225,13 +225,13 @@ class Qwen3NextMTP(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         cache_config = vllm_config.cache_config
         assert not cache_config.enable_prefix_caching, \
-            "Qwen3NextMTP currently does not support prefix caching"
+            "YuLanHybridMTP currently does not support prefix caching"
 
         self.quant_config = vllm_config.quant_config
 
         super().__init__()
         self.config = config
-        self.model = Qwen3NextMultiTokenPredictor(vllm_config=vllm_config,
+        self.model = YuLanHybridMultiTokenPredictor(vllm_config=vllm_config,
                                                   prefix=maybe_prefix(
                                                       prefix, "mtp"))
         self.unpadded_vocab_size = config.vocab_size

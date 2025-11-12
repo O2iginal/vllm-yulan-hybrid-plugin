@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inference-only Qwen3Next model."""
+"""Inference-only YuLanHybrid model."""
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Optional
@@ -10,45 +11,89 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
-
+from vllm import envs
 from vllm.attention import Attention, AttentionBackend, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import (CacheConfig, ModelConfig, SpeculativeConfig,
-                         VllmConfig, get_current_vllm_config)
-from vllm.distributed import (divide, get_ep_group, get_pp_group,
-                              get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_gather)
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,
+    SpeculativeConfig,
+    VllmConfig,
+    get_current_vllm_config,
+)
+from vllm.distributed import (
+    divide,
+    get_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops import (
-    RMSNormGated, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule)
+    RMSNormGated,
+    chunk_gated_delta_rule,
+    fused_recurrent_gated_delta_rule,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoE
+
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.model_executor.layers.layernorm import (
-    RMSNorm as Qwen3NextRMSNorm) # @gyzp change from GemmaRMSNorm to RMSNorm
+    RMSNorm as YuLanHybridRMSNorm,  # @gyzp change from GemmaRMSNorm to RMSNorm
+)
+
 # yapf: enable
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               ReplicatedLinear,
-                                               RowParallelLinear)
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.layers.mamba.mamba_mixer2 import (
-    mamba_v2_sharded_weight_loader)
+from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateDtypeCalculator, MambaStateShapeCalculator)
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
-    causal_conv1d_fn, causal_conv1d_update)
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.gptq import GPTQConfig
+from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
+    DEFAULT_VOCAB_PADDING_SIZE,
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, sharded_weight_loader)
-from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
-from vllm.model_executor.models.utils import sequence_parallel_chunk
+    default_weight_loader,
+    sharded_weight_loader,
+)
+from vllm.model_executor.models.interfaces import (
+    HasInnerState,
+    IsHybrid,
+    MixtureOfExperts,
+    SupportsLoRA,
+    SupportsPP,
+)
+from vllm.model_executor.models.mamba_cache import MambaCacheParams
+from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as YuLanHybridMLP
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    extract_layer_index,
+    is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+    maybe_prefix,
+)
+from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -57,35 +102,27 @@ from vllm.triton_utils import tl, triton
 from vllm.utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid, MixtureOfExperts,
-                         SupportsLoRA, SupportsPP)
-from vllm.model_executor.models.utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
-                    is_pp_missing_parameter,
-                    make_empty_intermediate_tensors_factory, make_layers,
-                    maybe_prefix)
-
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
-class Qwen3NextSparseMoeBlock(nn.Module):
+class YuLanHybridSparseMoeBlock(nn.Module):
 
-    def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        config: Qwen3NextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        enable_eplb: bool = False,
+    ):
         super().__init__()
-
-        config = vllm_config.model_config.hf_config
-        parallel_config = vllm_config.parallel_config
-        quant_config = vllm_config.quant_config
-
         self.tp_size = get_tensor_model_parallel_world_size()
 
         self.ep_group = get_ep_group().device_group
         self.ep_rank = self.ep_group.rank()
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
-
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         if config.num_experts > 0 and self.tp_size > config.num_experts:
             raise ValueError(
@@ -95,7 +132,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         # Load balancing settings.
         vllm_config = get_current_vllm_config()
         eplb_config = vllm_config.parallel_config.eplb_config
-        self.enable_eplb = parallel_config.enable_eplb
+        self.enable_eplb = enable_eplb
 
         self.n_logical_experts = self.n_routed_experts
         self.n_redundant_experts = eplb_config.num_redundant_experts
@@ -117,24 +154,23 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                 quant_config=quant_config,
                                 prefix=f"{prefix}.experts",
                                 enable_eplb=self.enable_eplb,
-                                num_redundant_experts=self.n_redundant_experts,
-                                is_sequence_parallel=self.is_sequence_parallel)
+                                num_redundant_experts=self.n_redundant_experts)
 
-        self.gate = ReplicatedLinear(config.hidden_size,
-                                     config.num_experts,
-                                     bias=False,
-                                     quant_config=quant_config,
-                                     prefix=f"{prefix}.gate")
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=self._maybe_ignore_quant_config(quant_config),
+            prefix=f"{prefix}.gate")
 
         if config.shared_expert_intermediate_size > 0:
-            self.shared_expert = Qwen3NextMLP(
+            self.shared_expert = YuLanHybridMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=self.experts.must_reduce_shared_expert_outputs(
                 ),
-                prefix=f"{prefix}.shared_expert",
             )
         else:
             self.shared_expert = None
@@ -142,14 +178,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                                   1,
                                                   bias=False)
 
+    def _maybe_ignore_quant_config(self, quant_config: QuantizationConfig):
+        # GPTQ configs do not have a list of ignored modules, however AutoGPTQ
+        # seems to avoid gate quantization.
+        # See: https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4
+        if isinstance(quant_config, (GPTQConfig, GPTQMarlinConfig)):
+            return None
+        return quant_config
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
-        num_tokens, hidden_dim = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
-
-        if self.is_sequence_parallel:
-            hidden_states = sequence_parallel_chunk(hidden_states)
 
         shared_output = None
         if self.shared_expert is not None:
@@ -165,19 +206,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-
-        if self.is_sequence_parallel:
-            final_hidden_states = tensor_model_parallel_all_gather(
-                final_hidden_states, 0)
-            final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1:
+        if self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
                 final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
 
 
-class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
+class YuLanHybridGatedDeltaNet(nn.Module, MambaBase):
 
     @property
     def mamba_type(self) -> str:
@@ -193,8 +229,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            self.tp_size, self.num_k_heads, self.num_v_heads, self.head_k_dim,
-            self.head_v_dim, self.conv_kernel_size, self.num_spec)
+            self.tp_size,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            self.conv_kernel_size,
+            self.num_spec,
+            use_v1=True)
 
     def __init__(
         self,
@@ -244,20 +286,12 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # projection of the input hidden states
         self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
         self.projection_size_ba = self.num_v_heads * 2
-        self.in_proj_qkvz = ColumnParallelLinear(
+        self.in_proj = MergedColumnParallelLinear(
             input_size=self.hidden_size,
-            output_size=self.projection_size_qkvz,
+            output_sizes=[self.projection_size_qkvz, self.projection_size_ba],
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_qkvz",
-        )
-        # ba_proj doesn't support blockwise fp8 quantization.
-        self.in_proj_ba = ColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_size=self.projection_size_ba,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_ba",
+            prefix=f"{prefix}.in_proj",
         )
 
         query_key_settings = (self.key_dim, 0, False)
@@ -291,12 +325,17 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         set_weight_attrs(self.dt_bias,
                          {"weight_loader": sharded_weight_loader(0)})
 
+        if "HACK_GDN_EPS" in os.environ:
+            gdn_eps = float(os.getenv('HACK_GDN_EPS'))
+            print(f"HACK_GDN_EPS 生效： {gdn_eps}")
+        else:
+            gdn_eps = self.layer_norm_epsilon
         self.norm = RMSNormGated(
             self.head_v_dim,
-            eps=self.layer_norm_epsilon,
+            eps=gdn_eps,
             group_size=None,
             norm_before_gate=True,
-            device=current_platform.current_device(),
+            device=torch.cuda.current_device(),
             dtype=config.torch_dtype,
         )
 
@@ -383,6 +422,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
+        cache_params: Optional[MambaCacheParams] = None,
     ):
         return torch.ops.vllm.gdn_attention(
             hidden_states,
@@ -415,16 +455,23 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         self_kv_cache = self.kv_cache[forward_context.virtual_engine]
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
-        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_actual_tokens = (attn_metadata.num_prefill_tokens +
+                             attn_metadata.num_decode_tokens +
+                             attn_metadata.num_spec_decode_tokens)
         num_accepted_tokens = attn_metadata.num_accepted_tokens
-        if spec_token_masks is not None:
-            spec_token_masks = spec_token_masks[:num_actual_tokens]
 
         # 1. Set up dimensions for reshapes later
-        projected_states_qkvz, _ = self.in_proj_qkvz(
-            hidden_states[:num_actual_tokens])
-        projected_states_ba, _ = self.in_proj_ba(
-            hidden_states[:num_actual_tokens])
+        projected_states, _ = self.in_proj(hidden_states[:num_actual_tokens])
+        if spec_token_masks is not None:
+            spec_token_masks = spec_token_masks[:num_actual_tokens]
+        projected_states_qkvz, projected_states_ba = torch.split(
+            projected_states,
+            [
+                self.projection_size_qkvz // self.tp_size,
+                self.projection_size_ba // self.tp_size
+            ],
+            dim=-1,
+        )
         query, key, value, z, b, a = self.fix_query_key_value_ordering(
             projected_states_qkvz, projected_states_ba)
         query, key, value = map(lambda x: rearrange(x, 'l p d -> l (p d)'),
@@ -449,6 +496,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         # 2.1: process the mutli-query part
         if spec_sequence_masks is not None:
+            mixed_qkv_spec = mixed_qkv_spec.view(
+                attn_metadata.num_spec_decodes, -1, mixed_qkv_spec.size(-1))
+            mixed_qkv_spec = rearrange(mixed_qkv_spec, 'b l d -> b d l')
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
@@ -458,18 +508,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 conv_state_indices=spec_state_indices_tensor[:, 0]
                 [:attn_metadata.num_spec_decodes],
                 num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
             )
+            mixed_qkv_spec = rearrange(mixed_qkv_spec, 'b d l -> (b l) d')
 
         # 2.2: process the remaining part
         if attn_metadata.num_prefills > 0:
-            mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
-            #   pointed to by "state_indices_tensor"
+            #   pointed to by "mamba_cache_params.state_indices_tensor"
             mixed_qkv_non_spec = causal_conv1d_fn(
-                mixed_qkv_non_spec_T,
+                mixed_qkv_non_spec.transpose(0, 1),
                 conv_weights,
                 self.conv1d.bias,
                 activation=self.activation,
@@ -477,7 +525,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             mixed_qkv_non_spec = causal_conv1d_update(
@@ -610,7 +657,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         output[:num_actual_tokens], _ = self.out_proj(core_attn_out)
 
 
-class Qwen3NextAttention(nn.Module):
+class YuLanHybridAttention(nn.Module):
 
     def __init__(
         self,
@@ -643,14 +690,14 @@ class Qwen3NextAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None)
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self.attn_output_gate = getattr(config, "attn_output_gate", False) # @gyzp disable attn output gate
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
-            bias=getattr(config, "qkv_bias", False),
+            bias=getattr(config, "qkv_bias", True), # @gyzp enable qkv bias
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
@@ -689,8 +736,8 @@ class Qwen3NextAttention(nn.Module):
         )
 
         # @gyzp disable qk norm
-        # self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        # self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # self.q_norm = YuLanHybridRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # self.k_norm = YuLanHybridRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -731,27 +778,27 @@ class Qwen3NextAttention(nn.Module):
         output[:], _ = self.o_proj(attn_output)
 
 
-class Qwen3NextDecoderLayer(nn.Module):
+class YuLanHybridDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
+        config: Qwen3NextConfig,
         layer_type: str,
+        model_config: Optional[ModelConfig] = None,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        speculative_config: Optional[SpeculativeConfig] = None,
         prefix: str = "",
+        enable_eplb: bool = False,
     ) -> None:
         super().__init__()
-
-        config = vllm_config.model_config.hf_config
-        model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-        speculative_config = vllm_config.speculative_config
+        self.config = config
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen3NextGatedDeltaNet(
+            self.linear_attn = YuLanHybridGatedDeltaNet(
                 config,
                 model_config=model_config,
                 cache_config=cache_config,
@@ -759,7 +806,7 @@ class Qwen3NextDecoderLayer(nn.Module):
                 speculative_config=speculative_config,
                 prefix=f'{prefix}.linear_attn')
         elif self.layer_type == "full_attention":
-            self.self_attn = Qwen3NextAttention(
+            self.self_attn = YuLanHybridAttention(
                 config,
                 model_config=model_config,
                 cache_config=cache_config,
@@ -774,21 +821,23 @@ class Qwen3NextDecoderLayer(nn.Module):
         if (self.layer_idx not in mlp_only_layers) and (
                 config.num_experts > 0 and
             (self.layer_idx + 1) % config.decoder_sparse_step == 0):
-            self.mlp = Qwen3NextSparseMoeBlock(
-                vllm_config=vllm_config,
+            self.mlp = YuLanHybridSparseMoeBlock(
+                config=config,
+                quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                enable_eplb=enable_eplb,
             )
         else:
-            self.mlp = Qwen3NextMLP(
+            self.mlp = YuLanHybridMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
             )
 
-        self.input_layernorm = Qwen3NextRMSNorm(config.hidden_size,
+        self.input_layernorm = YuLanHybridRMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3NextRMSNorm(
+        self.post_attention_layernorm = YuLanHybridRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps)
 
         self.layer_scale = getattr(config, "layer_scale", False)
@@ -797,14 +846,14 @@ class Qwen3NextDecoderLayer(nn.Module):
                 torch.zeros(
                     1,
                     1,
-                    config.hidden_size,
+                    self.config.hidden_size,
                     dtype=config.torch_dtype,
                 ), )
             self.ffn_layer_scale = torch.nn.Parameter(
                 torch.zeros(
                     1,
                     1,
-                    config.hidden_size,
+                    self.config.hidden_size,
                     dtype=config.torch_dtype,
                 ), )
 
@@ -866,14 +915,19 @@ class Qwen3NextDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class Qwen3NextModel(nn.Module):
+class YuLanHybridModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config: Qwen3NextConfig = vllm_config.model_config.hf_config
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
         lora_config = vllm_config.lora_config
+        speculative_config = vllm_config.speculative_config
+        enable_eplb = parallel_config.enable_eplb
         eplb_config = parallel_config.eplb_config
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
@@ -889,10 +943,15 @@ class Qwen3NextModel(nn.Module):
         )
 
         def get_layer(prefix: str):
-            return Qwen3NextDecoderLayer(
-                vllm_config,
+            return YuLanHybridDecoderLayer(
+                config,
                 layer_type=config.layer_types[extract_layer_index(prefix)],
+                model_config=model_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                speculative_config=speculative_config,
                 prefix=prefix,
+                enable_eplb=enable_eplb,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -902,7 +961,7 @@ class Qwen3NextModel(nn.Module):
                 ["hidden_states", "residual"], config.hidden_size))
 
         if get_pp_group().is_last_rank:
-            self.norm = Qwen3NextRMSNorm(config.hidden_size,
+            self.norm = YuLanHybridRMSNorm(config.hidden_size,
                                          eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -947,7 +1006,7 @@ class Qwen3NextModel(nn.Module):
         # 如果没有专家，返回空列表
         if self.config.num_experts == 0:
             return []
-            
+
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return FusedMoE.make_expert_params_mapping(
@@ -966,6 +1025,8 @@ class Qwen3NextModel(nn.Module):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
+            ("in_proj", "in_proj_qkvz", 0),
+            ("in_proj", "in_proj_ba", 1),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -1034,7 +1095,7 @@ class Qwen3NextModel(nn.Module):
         return loaded_params
 
 
-class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
+class YuLanHybridForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
                            MixtureOfExperts, IsHybrid):
     packed_modules_mapping = {
         "qkv_proj": [
@@ -1043,12 +1104,13 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
             "v_proj",
         ],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj": ["in_proj_qkvz", "in_proj_ba"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         GREEN = "\033[32m"
         RESET = "\033[0m"
-        print(f"{GREEN}\n[vLLM Plugin] Qwen3NextForCausalLM init\n{RESET}")
+        print(f"{GREEN}\n[vLLM Plugin] YuLanHybridForCausalLM init\n{RESET}")
         config = vllm_config.model_config.hf_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -1056,13 +1118,14 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         lora_config = vllm_config.lora_config
         scheduler_config = vllm_config.scheduler_config
         assert not cache_config.enable_prefix_caching, \
-            "Qwen3Next currently does not support prefix caching"
+            "YuLanHybrid currently does not support prefix caching"
+        assert envs.VLLM_USE_V1, "YuLanHybrid requires VLLM_USE_V1"
         self.quant_config = vllm_config.quant_config
 
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
-        self.model = Qwen3NextModel(vllm_config=vllm_config,
+        self.model = YuLanHybridModel(vllm_config=vllm_config,
                                     prefix=maybe_prefix(prefix, "model"))
         self.unpadded_vocab_size = config.vocab_size
         if lora_config:
@@ -1075,7 +1138,7 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
             # We need bigger padding if using lora for kernel
             # compatibility
             if not lora_config else lora_config.lora_vocab_padding_size,
-            prefix=maybe_prefix(prefix, "lm_head"))
+        )
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
         self.make_empty_intermediate_tensors = (
@@ -1083,7 +1146,6 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
 
         # Set MoE hyperparameters
         self.expert_weights = []
-
         self.moe_layers: list[FusedMoE] = []
 
         # 检查是否有 MoE 层, @gyzp 可禁用 MoE
@@ -1104,13 +1166,13 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
                 if isinstance(layer, PPMissingLayer):
                     continue
 
-                assert isinstance(layer, Qwen3NextDecoderLayer)
-                if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
+                assert isinstance(layer, YuLanHybridDecoderLayer)
+                if isinstance(layer.mlp, YuLanHybridSparseMoeBlock):
                     example_layer = layer.mlp
                     self.moe_layers.append(layer.mlp.experts)
 
             if example_layer is None:
-                raise RuntimeError("No Qwen3Next layer found in the model.layers.")
+                raise RuntimeError("No YuLanHybrid layer found in the model.layers.")
 
             self.num_moe_layers = len(self.moe_layers)
             self.num_expert_groups = 1
@@ -1130,7 +1192,7 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         # 如果没有 MoE 层，直接返回
         if self.config.num_experts == 0:
             return
-            
+
         for layer_idx, layer in enumerate(self.moe_layers):
             # Register the expert weights.
             self.expert_weights.append(layer.get_expert_weights())
@@ -1149,14 +1211,14 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         # 如果没有 MoE 层，直接返回
         if self.config.num_experts == 0:
             return
-            
+
         assert self.num_local_physical_experts == num_local_physical_experts
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = (num_physical_experts -
                                       self.num_logical_experts)
         for layer in self.model.layers:
-            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
+            if isinstance(layer.mlp, YuLanHybridSparseMoeBlock):
                 moe = layer.mlp
                 moe.n_local_physical_experts = num_local_physical_experts
                 moe.n_physical_experts = num_physical_experts
@@ -1198,16 +1260,22 @@ class Qwen3NextForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         num_spec = (vllm_config.speculative_config.num_speculative_tokens
                     if vllm_config.speculative_config else 0)
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
-            tp_size, hf_config.linear_num_key_heads,
-            hf_config.linear_num_value_heads, hf_config.linear_key_head_dim,
-            hf_config.linear_value_head_dim, hf_config.linear_conv_kernel_dim,
-            num_spec)
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+            use_v1=True)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        return self.logits_processor(self.lm_head, hidden_states)
+        return self.logits_processor(self.lm_head, hidden_states,
+                                     sampling_metadata)
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
@@ -1244,6 +1312,7 @@ direct_register_custom_op(
     op_func=gdn_attention,
     mutates_args=["output"],
     fake_impl=gdn_attention_fake,
+    dispatch_key=current_platform.dispatch_key,
 )
 
 

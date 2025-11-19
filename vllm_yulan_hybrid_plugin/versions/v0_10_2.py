@@ -265,6 +265,8 @@ class YuLanHybridGatedDeltaNet(nn.Module, MambaBase):
         self.layer_norm_epsilon = config.rms_norm_eps
         self.prefix = prefix
 
+        print(f"[DEBUG] CustomGatedDeltaNet initialized with prefix: {prefix}") 
+
         self.config = config
         self.model_config = model_config
         self.cache_config = cache_config
@@ -350,6 +352,9 @@ class YuLanHybridGatedDeltaNet(nn.Module, MambaBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        
+        print(f"[DEBUG] Registered in ForwardContext with key: {prefix}")
+        
 
     def fix_query_key_value_ordering(
         self,
@@ -424,6 +429,12 @@ class YuLanHybridGatedDeltaNet(nn.Module, MambaBase):
         output: torch.Tensor,
         cache_params: Optional[MambaCacheParams] = None,
     ):
+        # FIXME 暂时使用 Qwen3 Next 算子，此时修改本文件 _forward 无效
+        # return torch.ops.vllm.yulan_hybrid_gdn_attention(
+        #     hidden_states,
+        #     output,
+        #     self.prefix,
+        # )
         return torch.ops.vllm.gdn_attention(
             hidden_states,
             output,
@@ -1122,6 +1133,10 @@ class YuLanHybridForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         assert envs.VLLM_USE_V1, "YuLanHybrid requires VLLM_USE_V1"
         self.quant_config = vllm_config.quant_config
 
+        print(f"[DEBUG] Initializing CustomNameForCausalLM with prefix: {prefix}")  
+        print(f"[DEBUG] Config architectures: {vllm_config.model_config.hf_config.architectures}")  
+        print(f"[DEBUG] Model class: {self.__class__.__name__}")  
+
         super().__init__()
         self.config = config
         self.scheduler_config = scheduler_config
@@ -1289,31 +1304,31 @@ class YuLanHybridForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         return self.model.get_expert_mapping()
 
 
-def gdn_attention(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-) -> None:
-    forward_context: ForwardContext = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-    self._forward(hidden_states=hidden_states, output=output)
+# def yulan_hybrid_gdn_attention(
+#     hidden_states: torch.Tensor,
+#     output: torch.Tensor,
+#     layer_name: str,
+# ) -> None:
+#     forward_context: ForwardContext = get_forward_context()
+#     self = forward_context.no_compile_layers[layer_name]
+#     self._forward(hidden_states=hidden_states, output=output)
 
 
-def gdn_attention_fake(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-) -> None:
-    return
+# def yulan_hybrid_gdn_attention_fake(
+#     hidden_states: torch.Tensor,
+#     output: torch.Tensor,
+#     layer_name: str,
+# ) -> None:
+#     return
 
 
-direct_register_custom_op(
-    op_name="gdn_attention",
-    op_func=gdn_attention,
-    mutates_args=["output"],
-    fake_impl=gdn_attention_fake,
-    dispatch_key=current_platform.dispatch_key,
-)
+# direct_register_custom_op(
+#     op_name="yulan_hybrid_gdn_attention",
+#     op_func=yulan_hybrid_gdn_attention,
+#     mutates_args=["output"],
+#     fake_impl=yulan_hybrid_gdn_attention_fake,
+#     dispatch_key=current_platform.dispatch_key,
+# )
 
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)

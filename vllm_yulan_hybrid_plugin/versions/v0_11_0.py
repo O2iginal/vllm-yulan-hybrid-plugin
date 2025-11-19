@@ -384,6 +384,12 @@ class YuLanHybridGatedDeltaNet(nn.Module, MambaBase):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
     ):
+        # FIXME 暂时使用 Qwen3 Next 算子，此时修改本文件 _forward 无效
+        # return torch.ops.vllm.yulan_hybrid_gdn_attention(
+        #     hidden_states,
+        #     output,
+        #     self.prefix,
+        # )
         return torch.ops.vllm.gdn_attention(
             hidden_states,
             output,
@@ -1221,30 +1227,30 @@ class YuLanHybridForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
         return self.model.get_expert_mapping()
 
 
-def gdn_attention(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-) -> None:
-    forward_context: ForwardContext = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-    self._forward(hidden_states=hidden_states, output=output)
+# def yulan_hybrid_gdn_attention(
+#     hidden_states: torch.Tensor,
+#     output: torch.Tensor,
+#     layer_name: str,
+# ) -> None:
+#     forward_context: ForwardContext = get_forward_context()
+#     self = forward_context.no_compile_layers[layer_name]
+#     self._forward(hidden_states=hidden_states, output=output)
 
 
-def gdn_attention_fake(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-) -> None:
-    return
+# def yulan_hybrid_gdn_attention_fake(
+#     hidden_states: torch.Tensor,
+#     output: torch.Tensor,
+#     layer_name: str,
+# ) -> None:
+#     return
 
 
-direct_register_custom_op(
-    op_name="gdn_attention",
-    op_func=gdn_attention,
-    mutates_args=["output"],
-    fake_impl=gdn_attention_fake,
-)
+# direct_register_custom_op(
+#     op_name="yulan_hybrid_gdn_attention",
+#     op_func=yulan_hybrid_gdn_attention,
+#     mutates_args=["output"],
+#     fake_impl=yulan_hybrid_gdn_attention_fake,
+# )
 
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)

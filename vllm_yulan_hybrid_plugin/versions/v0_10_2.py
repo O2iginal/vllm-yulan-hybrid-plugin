@@ -1303,7 +1303,7 @@ class YuLanHybridForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
-
+# FIXME
 # def yulan_hybrid_gdn_attention(
 #     hidden_states: torch.Tensor,
 #     output: torch.Tensor,
